@@ -1,4 +1,4 @@
-[README.md](https://github.com/user-attachments/files/26455976/README.md)
+[README.md](https://github.com/user-attachments/files/26457635/README.md)
 # 治療日誌マスタ化出力ツール
 
 治療日誌の `.xlsm` を複数読み込みし、`ThisWorkbook` 側に縦持ちマスタを生成する VBA ソースです。  
@@ -20,13 +20,15 @@
 - `店舗リファレンス` の `使用中フラグ` は空欄を有効扱いにしています。`0 / FALSE / NO / N / 無効 / 停止` は無効扱いです。
 - 1回の取込は単一店舗運用を前提にしています。治療日誌と `id店舗名.xlsx` は同じ店舗のものを選択してください。
 - `id店舗名.xlsx` は `新患分析` シートを持ち、`B列=顧客No` `C列=患者名` を使います。
+- マクロを格納したブック名は `来院履歴マスタ_店舗ID_店舗名.xlsm` 形式を想定しています。例: `来院履歴マスタ_01_国立.xlsm`
 
 ## セットアップ
 
 1. 任意のマクロ有効ブックを作成します。
 2. VBA エディタで標準モジュールを追加し、[dist/modTreatmentDiaryImporter_sjis.bas](C:/Users/yuuki/OneDrive/ドキュメント/マイドキュメント/システム案件/治療日誌マスタ化出力ツール/dist/modTreatmentDiaryImporter_sjis.bas) をインポートします。
 3. `InitializeTreatmentDiaryWorkbook` を実行します。
-4. 生成された `店舗リファレンス` シートに `店舗ID / 店舗名 / 使用中フラグ` を設定します。
+4. `InitializeTreatmentDiaryWorkbook` は、ブック名から `店舗ID / 店舗名` を取得して `店舗リファレンス` シートへ自動設定します。
+5. ブック名から取得できなかった場合だけ、`店舗リファレンス` シートを手修正してください。
 
 ## 実行マクロ
 
@@ -63,9 +65,12 @@
 
 - 取込開始時に、前回までの `取込実行ログ` と `取込詳細ログ` を `.log` ファイルへ退避します。
 - 退避後、シート上のログは2行目以降をクリアしてから今回の取込を開始します。
-- ログファイルは、このツールを入れたブックと同じ階層の `log` フォルダへ出力します。
+- ログファイルは、実行した `来院履歴マスタ_*.xlsm` と同じ階層の `log` フォルダへ出力します。
+- 例: `C:\...\分析用データ\来院履歴マスタ_01_国立.xlsm` を実行した場合、`C:\...\分析用データ\log\import_YYYYMMDD_HHMMSS.log` へ出力します。
 - `log` フォルダがなければ自動作成します。
-- ログファイル名は `治療日誌取込ログ_YYYYMMDD_HHMMSS.log` です。
+- ログファイル名は `import_YYYYMMDD_HHMMSS.log` です。
+- ブックのパスが `https://d.docs.live.net/...` のような OneDrive URL で取得される場合は、`FullName` からローカルの OneDrive 同期ファイルへ変換し、その親フォルダ直下へ `log` フォルダを作成します。
+- 退避が実行された場合は、今回の `取込実行ログ` に `INFO` 行で退避先フルパスを残します。
 
 ## 実装済みルール
 
