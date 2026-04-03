@@ -6,6 +6,9 @@ Private Const REFERENCE_SHEET_NAME As String = "店舗リファレンス"
 Private Const EXEC_LOG_SHEET_NAME As String = "取込実行ログ"
 Private Const DETAIL_LOG_SHEET_NAME As String = "取込詳細ログ"
 Private Const TRANSFER_SHEET_NAME As String = "転記"
+Private Const NEW_PATIENT_SHEET_NAME As String = "新患分析"
+Private Const NEW_PATIENT_ID_COLUMN As Long = 2
+Private Const NEW_PATIENT_NAME_COLUMN As Long = 3
 
 Private Const DATE_ROW_INDEX As Long = 1
 Private Const DATA_START_ROW As Long = 4
@@ -18,6 +21,12 @@ Private Type AppState
     EnableEvents As Boolean
     DisplayAlerts As Boolean
     Calculation As XlCalculation
+End Type
+
+Private Type CustomerResolution
+    CustomerId As String
+    StatusText As String
+    WarningMessage As String
 End Type
 
 Public Sub InitializeTreatmentDiaryWorkbook()
@@ -90,6 +99,7 @@ End Sub
 Private Sub RunImport(ByVal filePaths As Collection, ByVal sourceLabel As String)
     Dim state As AppState
     Dim storeMap As Object
+    Dim patientMap As Object
     Dim importKeys As Object
     Dim startedAt As Date
     Dim filePath As Variant
@@ -97,8 +107,15 @@ Private Sub RunImport(ByVal filePaths As Collection, ByVal sourceLabel As String
     Dim successFiles As Long
     Dim failedFiles As Long
     Dim totalOutputRows As Long
+    Dim analysisWorkbookPath As String
+    Dim importSequence As Long
 
     On Error GoTo ErrHandler
+
+    analysisWorkbookPath = PickPatientAnalysisWorkbook()
+    If Len(analysisWorkbookPath) = 0 Then
+        Exit Sub
+    End If
 
     SaveAppState state
     ApplyFastSettings
@@ -107,10 +124,16 @@ Private Sub RunImport(ByVal filePaths As Collection, ByVal sourceLabel As String
     EnsureSheetWithHeaders REFERENCE_SHEET_NAME, ReferenceHeaders()
     EnsureSheetWithHeaders EXEC_LOG_SHEET_NAME, ExecutionLogHeaders()
     EnsureSheetWithHeaders DETAIL_LOG_SHEET_NAME, DetailLogHeaders()
+    ArchiveAndClearImportLogs
 
     Set storeMap = LoadStoreMap(ThisWorkbook.Worksheets(REFERENCE_SHEET_NAME))
     If storeMap.Count = 0 Then
         Err.Raise vbObjectError + 1000, , "店舗リファレンスに有効な店舗情報がありません。"
+    End If
+
+    Set patientMap = LoadPatientMap(analysisWorkbookPath)
+    If patientMap.Count = 0 Then
+        Err.Raise vbObjectError + 1006, , "新患分析に有効な患者情報がありません。"
     End If
 
     Set importKeys = LoadExistingImportKeys(ThisWorkbook.Worksheets(MASTER_SHEET_NAME))
@@ -119,7 +142,7 @@ Private Sub RunImport(ByVal filePaths As Collection, ByVal sourceLabel As String
     For Each filePath In filePaths
         outputCount = 0
 
-        If ProcessSingleFile(CStr(filePath), startedAt, storeMap, importKeys, outputCount) Then
+        If ProcessSingleFile(CStr(filePath), startedAt, storeMap, patientMap, importKeys, importSequence, outputCount) Then
             successFiles = successFiles + 1
             totalOutputRows = totalOutputRows + outputCount
         Else
@@ -144,7 +167,9 @@ Private Function ProcessSingleFile( _
     ByVal filePath As String, _
     ByVal startedAt As Date, _
     ByVal storeMap As Object, _
+    ByVal patientMap As Object, _
     ByVal importKeys As Object, _
+    ByRef importSequence As Long, _
     ByRef outputCount As Long) As Boolean
 
     Dim sourceBook As Workbook
@@ -255,7 +280,9 @@ Private Function ProcessSingleFile( _
             baseYear, _
             baseMonth, _
             startedAt, _
+            patientMap, _
             importKeys, _
+            importSequence, _
             masterRows, _
             detailLogs, _
             fileYearMonth, _
@@ -314,7 +341,7 @@ FileError:
     Else
         MsgBox fileName & " にエラーがあります。" & vbCrLf & _
                "ログを確認してください。" & vbCrLf & _
-               "また、該当ファイルの出力データを削除してから再実行してください。", vbExclamation
+               "該当ファイルはマスタに反映されていません。修正後に再実行してください。", vbExclamation
     End If
 
     ProcessSingleFile = False
@@ -350,7 +377,9 @@ Private Function ProcessSheet( _
     ByVal baseYear As Long, _
     ByVal baseMonth As Long, _
     ByVal startedAt As Date, _
+    ByVal patientMap As Object, _
     ByVal importKeys As Object, _
+    ByRef importSequence As Long, _
     ByVal masterRows As Collection, _
     ByVal detailLogs As Collection, _
     ByRef fileYearMonth As String, _
@@ -372,6 +401,8 @@ Private Function ProcessSheet( _
     Dim currentYearMonth As String
     Dim feeColumn As Long
     Dim stepName As String
+    Dim customerResolution As CustomerResolution
+    Dim internalImportId As String
 
     On Error GoTo ErrHandler
 
@@ -432,8 +463,20 @@ Private Function ProcessSheet( _
                         End If
                     Next feeColumn
 
+                    stepName = "顧客ID判定"
+                    importSequence = importSequence + 1
+                    internalImportId = BuildInternalImportId(startedAt, importSequence)
+                    customerResolution = ResolveCustomerId(patientMap, patientName, internalImportId)
+                    If Len(customerResolution.WarningMessage) > 0 Then
+                        warningCount = warningCount + 1
+                        AddDetailLogRow detailLogs, startedAt, fileName, sourceSheet.Name, targetDate, patientName, staffName, "警告", customerResolution.WarningMessage
+                    End If
+
                     stepName = "マスタ行追加"
                     AddMasterRow masterRows, _
+                                 customerResolution.CustomerId, _
+                                 customerResolution.StatusText, _
+                                 internalImportId, _
                                  targetDate, _
                                  currentYearMonth, _
                                  NormalizeOutputValue(treatmentTime), _
@@ -593,8 +636,8 @@ Private Function LoadExistingImportKeys(ByVal masterSheet As Worksheet) As Objec
     sourceValues = masterSheet.Range(masterSheet.Cells(2, 1), masterSheet.Cells(lastRow, UBound(MasterHeaders()) + 1)).Value2
 
     For rowIndex = 1 To UBound(sourceValues, 1)
-        fileName = NormalizeText(sourceValues(rowIndex, 10))
-        yearMonth = NormalizeText(sourceValues(rowIndex, 2))
+        fileName = NormalizeText(sourceValues(rowIndex, 13))
+        yearMonth = NormalizeText(sourceValues(rowIndex, 5))
 
         If Len(fileName) > 0 And Len(yearMonth) > 0 Then
             importKeys(BuildImportKey(fileName, yearMonth)) = True
@@ -606,6 +649,9 @@ End Function
 
 Private Sub AddMasterRow( _
     ByVal rows As Collection, _
+    ByVal customerId As String, _
+    ByVal customerStatus As String, _
+    ByVal internalImportId As String, _
     ByVal targetDate As Date, _
     ByVal yearMonth As String, _
     ByVal treatmentTime As Variant, _
@@ -621,6 +667,9 @@ Private Sub AddMasterRow( _
     ByVal importedAt As Date)
 
     rows.Add Array( _
+        customerId, _
+        customerStatus, _
+        internalImportId, _
         targetDate, _
         yearMonth, _
         treatmentTime, _
@@ -714,8 +763,11 @@ Private Sub EnsureSheetWithHeaders(ByVal sheetName As String, ByVal headers As V
     Dim targetSheet As Worksheet
     Dim columnIndex As Long
     Dim existingValue As String
+    Dim canResetHeaders As Boolean
+    Dim hasMismatch As Boolean
 
     Set targetSheet = GetOrCreateWorksheet(sheetName)
+    canResetHeaders = Not SheetHasDataRows(targetSheet)
 
     If Application.WorksheetFunction.CountA(targetSheet.Rows(1)) = 0 Then
         For columnIndex = LBound(headers) To UBound(headers)
@@ -727,12 +779,24 @@ Private Sub EnsureSheetWithHeaders(ByVal sheetName As String, ByVal headers As V
 
     For columnIndex = LBound(headers) To UBound(headers)
         existingValue = NormalizeText(targetSheet.Cells(1, columnIndex + 1).Value)
-        If Len(existingValue) = 0 Then
-            targetSheet.Cells(1, columnIndex + 1).Value = headers(columnIndex)
-        ElseIf existingValue <> CStr(headers(columnIndex)) Then
-            Err.Raise vbObjectError + 1100, , """" & sheetName & """ シートのヘッダーが想定と異なります。"
+        If existingValue <> CStr(headers(columnIndex)) Then
+            hasMismatch = True
+            Exit For
         End If
     Next columnIndex
+
+    If hasMismatch Then
+        If canResetHeaders Then
+            targetSheet.Rows(1).ClearContents
+            For columnIndex = LBound(headers) To UBound(headers)
+                targetSheet.Cells(1, columnIndex + 1).Value = headers(columnIndex)
+            Next columnIndex
+            targetSheet.Rows(1).Font.Bold = True
+            Exit Sub
+        End If
+
+        Err.Raise vbObjectError + 1100, , """" & sheetName & """ シートのヘッダーが想定と異なります。"
+    End If
 End Sub
 
 Private Function GetOrCreateWorksheet(ByVal sheetName As String) As Worksheet
@@ -795,6 +859,186 @@ Private Function PickFolder() As String
 
         PickFolder = .SelectedItems(1)
     End With
+End Function
+
+Private Function PickPatientAnalysisWorkbook() As String
+    Dim dialog As FileDialog
+
+    Set dialog = Application.FileDialog(msoFileDialogFilePicker)
+    With dialog
+        .Title = "新患分析 / id店舗名.xlsx を選択してください"
+        .AllowMultiSelect = False
+        .Filters.Clear
+        .Filters.Add "Excel Workbook", "*.xlsx;*.xlsm;*.xls"
+
+        If .Show <> -1 Then
+            Exit Function
+        End If
+
+        PickPatientAnalysisWorkbook = CStr(.SelectedItems(1))
+    End With
+End Function
+
+Private Function LoadPatientMap(ByVal workbookPath As String) As Object
+    Dim patientMap As Object
+    Dim sourceBook As Workbook
+    Dim sourceSheet As Worksheet
+    Dim normalizedPath As String
+    Dim openedFilePath As String
+    Dim tempOpenPath As String
+    Dim openErrorMessage As String
+    Dim lastRow As Long
+    Dim rowIndex As Long
+    Dim patientName As String
+    Dim customerId As String
+    Dim physicalFileName As String
+    Dim logicalFileName As String
+    Dim raisedNumber As Long
+    Dim raisedDescription As String
+
+    On Error GoTo ErrHandler
+
+    Set patientMap = CreateObject("Scripting.Dictionary")
+    normalizedPath = NormalizeWorkbookPath(workbookPath)
+    If Not FileExists(normalizedPath) Then
+        Err.Raise vbObjectError + 1007, , "新患分析ファイルが見つかりません。 path=" & normalizedPath
+    End If
+
+    physicalFileName = GetFileName(normalizedPath)
+    logicalFileName = GetLogicalFileName(normalizedPath)
+    If physicalFileName <> logicalFileName Then
+        tempOpenPath = CreateTempWorkbookCopy(normalizedPath, logicalFileName)
+        openedFilePath = tempOpenPath
+    Else
+        openedFilePath = normalizedPath
+    End If
+
+    Set sourceBook = TryOpenWorkbookReadOnly(openedFilePath, openErrorMessage)
+    If sourceBook Is Nothing And openedFilePath = normalizedPath Then
+        tempOpenPath = CreateTempWorkbookCopy(normalizedPath, logicalFileName)
+        openedFilePath = tempOpenPath
+        Set sourceBook = TryOpenWorkbookReadOnly(openedFilePath, openErrorMessage)
+    End If
+    If sourceBook Is Nothing Then
+        Err.Raise vbObjectError + 1008, , "新患分析ファイルを開けません。 path=" & openedFilePath & " / detail=" & openErrorMessage
+    End If
+
+    If Not WorksheetExists(sourceBook, NEW_PATIENT_SHEET_NAME) Then
+        Err.Raise vbObjectError + 1009, , "新患分析ファイルに """ & NEW_PATIENT_SHEET_NAME & """ シートが存在しません。"
+    End If
+
+    Set sourceSheet = sourceBook.Worksheets(NEW_PATIENT_SHEET_NAME)
+    lastRow = LastDataRow(sourceSheet, NEW_PATIENT_NAME_COLUMN)
+    For rowIndex = 2 To lastRow
+        patientName = NormalizeText(sourceSheet.Cells(rowIndex, NEW_PATIENT_NAME_COLUMN).Value)
+        customerId = NormalizeCustomerIdValue(sourceSheet.Cells(rowIndex, NEW_PATIENT_ID_COLUMN).Value)
+        AddPatientMapEntry patientMap, patientName, customerId
+    Next rowIndex
+
+SafeExit:
+    If Not sourceBook Is Nothing Then
+        sourceBook.Close SaveChanges:=False
+    End If
+    DeleteFileIfExists tempOpenPath
+    Set LoadPatientMap = patientMap
+    Exit Function
+
+ErrHandler:
+    raisedNumber = Err.Number
+    raisedDescription = Err.Description
+    On Error Resume Next
+    If Not sourceBook Is Nothing Then
+        sourceBook.Close SaveChanges:=False
+    End If
+    DeleteFileIfExists tempOpenPath
+    Err.Raise raisedNumber, , raisedDescription
+End Function
+
+Private Sub AddPatientMapEntry(ByVal patientMap As Object, ByVal patientName As String, ByVal customerId As String)
+    Dim patientKey As String
+    Dim patientInfo As Object
+    Dim candidateIds As Object
+    Dim numericCustomerId As Double
+
+    patientKey = NormalizePatientNameKey(patientName)
+    If Len(patientKey) = 0 Then
+        Exit Sub
+    End If
+
+    If patientMap.Exists(patientKey) Then
+        Set patientInfo = patientMap(patientKey)
+    Else
+        Set patientInfo = CreateObject("Scripting.Dictionary")
+        patientInfo("row_count") = 0
+        patientInfo("latest_id") = vbNullString
+        patientInfo("latest_id_value") = -1#
+        Set candidateIds = CreateObject("Scripting.Dictionary")
+        patientInfo.Add "candidate_ids", candidateIds
+        patientMap.Add patientKey, patientInfo
+    End If
+
+    patientInfo("row_count") = CLng(patientInfo("row_count")) + 1
+
+    If Len(customerId) = 0 Then
+        Exit Sub
+    End If
+
+    Set candidateIds = patientInfo("candidate_ids")
+    If Not candidateIds.Exists(customerId) Then
+        candidateIds.Add customerId, CDbl(customerId)
+    End If
+
+    numericCustomerId = CDbl(customerId)
+    If numericCustomerId >= CDbl(patientInfo("latest_id_value")) Then
+        patientInfo("latest_id_value") = numericCustomerId
+        patientInfo("latest_id") = customerId
+    End If
+End Sub
+
+Private Function ResolveCustomerId(ByVal patientMap As Object, ByVal patientName As String, ByVal internalImportId As String) As CustomerResolution
+    Dim patientKey As String
+    Dim patientInfo As Object
+    Dim candidateIds As Object
+    Dim latestId As String
+
+    patientKey = NormalizePatientNameKey(patientName)
+
+    If Len(patientKey) = 0 Then
+        ResolveCustomerId.CustomerId = BuildTemporaryCustomerId(internalImportId)
+        ResolveCustomerId.StatusText = "仮"
+        ResolveCustomerId.WarningMessage = "顧客ID（カルテNo）が取得できません。治療日誌の患者名が空欄です。"
+        Exit Function
+    End If
+
+    If Not patientMap.Exists(patientKey) Then
+        ResolveCustomerId.CustomerId = BuildTemporaryCustomerId(internalImportId)
+        ResolveCustomerId.StatusText = "仮"
+        ResolveCustomerId.WarningMessage = "顧客ID（カルテNo）が取得できません。治療日誌の名前と新患分析の名前が一致していません。新患分析の名前を確認してください。治療日誌の名前: " & patientName
+        Exit Function
+    End If
+
+    Set patientInfo = patientMap(patientKey)
+    Set candidateIds = patientInfo("candidate_ids")
+    If candidateIds.Count = 0 Then
+        ResolveCustomerId.CustomerId = BuildTemporaryCustomerId(internalImportId)
+        ResolveCustomerId.StatusText = "仮"
+        ResolveCustomerId.WarningMessage = "顧客ID（カルテNo）が未登録です。新患分析の顧客Noを確認してください。治療日誌の名前: " & patientName
+        Exit Function
+    End If
+
+    latestId = CStr(patientInfo("latest_id"))
+    ResolveCustomerId.CustomerId = latestId
+
+    If CLng(patientInfo("row_count")) > 1 Then
+        ResolveCustomerId.StatusText = "警告"
+        If candidateIds.Count > 1 Then
+            ResolveCustomerId.WarningMessage = "同じ名前の方がいます。候補: " & JoinCandidateIds(candidateIds) & "。最新の顧客ID No" & latestId & " を採用しました。"
+        Else
+            ResolveCustomerId.WarningMessage = "同じ名前の方がいます。顧客ID No" & latestId & " を採用しました。"
+        End If
+    Else
+        ResolveCustomerId.StatusText = "確定"
+    End If
 End Function
 
 Private Function BlockHasInputRows(ByVal sourceValues As Variant, ByVal baseColumn As Long) As Boolean
@@ -999,6 +1243,34 @@ Private Function NormalizeText(ByVal value As Variant) As String
     NormalizeText = Trim$(textValue)
 End Function
 
+Private Function NormalizePatientNameKey(ByVal value As Variant) As String
+    Dim normalized As String
+
+    normalized = NormalizeText(value)
+    normalized = Replace(normalized, " ", vbNullString)
+    normalized = Replace(normalized, ChrW$(12288), vbNullString)
+    NormalizePatientNameKey = normalized
+End Function
+
+Private Function NormalizeCustomerIdValue(ByVal value As Variant) As String
+    Dim normalized As String
+
+    If IsError(value) Or IsBlankCellValue(value) Then
+        Exit Function
+    End If
+
+    normalized = NormalizeText(value)
+    If Len(normalized) = 0 Then
+        Exit Function
+    End If
+
+    If IsNumeric(normalized) Then
+        If CDbl(normalized) = Fix(CDbl(normalized)) Then
+            NormalizeCustomerIdValue = CStr(Fix(CDbl(normalized)))
+        End If
+    End If
+End Function
+
 Private Function NormalizeOutputValue(ByVal value As Variant) As Variant
     If IsError(value) Or IsBlankCellValue(value) Then
         NormalizeOutputValue = vbNullString
@@ -1089,6 +1361,39 @@ End Function
 
 Private Function BuildImportKey(ByVal fileName As String, ByVal yearMonth As String) As String
     BuildImportKey = UCase$(fileName) & "|" & yearMonth
+End Function
+
+Private Function BuildInternalImportId(ByVal startedAt As Date, ByVal importSequence As Long) As String
+    BuildInternalImportId = Format$(startedAt, "yyyymmddhhnnss") & Format$(importSequence, "0000")
+End Function
+
+Private Function BuildTemporaryCustomerId(ByVal internalImportId As String) As String
+    BuildTemporaryCustomerId = "-" & internalImportId
+End Function
+
+Private Function JoinCandidateIds(ByVal candidateIds As Object) As String
+    Dim keys As Variant
+    Dim indexA As Long
+    Dim indexB As Long
+    Dim swapValue As Variant
+
+    keys = candidateIds.Keys
+    For indexA = LBound(keys) To UBound(keys) - 1
+        For indexB = indexA + 1 To UBound(keys)
+            If CDbl(keys(indexA)) > CDbl(keys(indexB)) Then
+                swapValue = keys(indexA)
+                keys(indexA) = keys(indexB)
+                keys(indexB) = swapValue
+            End If
+        Next indexB
+    Next indexA
+
+    For indexA = LBound(keys) To UBound(keys)
+        If indexA > LBound(keys) Then
+            JoinCandidateIds = JoinCandidateIds & ", "
+        End If
+        JoinCandidateIds = JoinCandidateIds & "No" & CStr(keys(indexA))
+    Next indexA
 End Function
 
 Private Sub ExtractYearMonthFromPath(ByVal filePath As String, ByRef baseYear As Long, ByRef baseMonth As Long)
@@ -1278,6 +1583,151 @@ Private Function LastDataRow(ByVal targetSheet As Worksheet, ByVal keyColumn As 
     LastDataRow = lastRow
 End Function
 
+Private Function SheetHasDataRows(ByVal targetSheet As Worksheet) As Boolean
+    Dim usedLastRow As Long
+    Dim usedLastColumn As Long
+
+    On Error GoTo SafeExit
+
+    usedLastRow = targetSheet.Cells.Find(What:="*", After:=targetSheet.Cells(1, 1), LookIn:=xlFormulas, _
+                                         LookAt:=xlPart, SearchOrder:=xlByRows, SearchDirection:=xlPrevious, MatchCase:=False).Row
+    usedLastColumn = targetSheet.Cells.Find(What:="*", After:=targetSheet.Cells(1, 1), LookIn:=xlFormulas, _
+                                            LookAt:=xlPart, SearchOrder:=xlByColumns, SearchDirection:=xlPrevious, MatchCase:=False).Column
+    SheetHasDataRows = (usedLastRow > 1) Or (usedLastRow = 1 And usedLastColumn > 0 And Application.WorksheetFunction.CountA(targetSheet.Rows(1)) = 0)
+    Exit Function
+
+SafeExit:
+    SheetHasDataRows = False
+End Function
+
+Private Sub ArchiveAndClearImportLogs()
+    Dim execSheet As Worksheet
+    Dim detailSheet As Worksheet
+
+    Set execSheet = ThisWorkbook.Worksheets(EXEC_LOG_SHEET_NAME)
+    Set detailSheet = ThisWorkbook.Worksheets(DETAIL_LOG_SHEET_NAME)
+
+    ArchiveImportLogs execSheet, detailSheet, Now
+    ClearSheetDataRows execSheet
+    ClearSheetDataRows detailSheet
+End Sub
+
+Private Sub ArchiveImportLogs(ByVal execSheet As Worksheet, ByVal detailSheet As Worksheet, ByVal archivedAt As Date)
+    Dim hasExecLogs As Boolean
+    Dim hasDetailLogs As Boolean
+    Dim fso As Object
+    Dim logStream As Object
+    Dim outputPath As String
+
+    hasExecLogs = SheetHasDataRows(execSheet)
+    hasDetailLogs = SheetHasDataRows(detailSheet)
+    If Not hasExecLogs And Not hasDetailLogs Then
+        Exit Sub
+    End If
+
+    outputPath = BuildImportLogFilePath(archivedAt)
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    Set logStream = fso.CreateTextFile(outputPath, True, True)
+
+    logStream.WriteLine "治療日誌取込ログ"
+    logStream.WriteLine "出力日時: " & Format$(archivedAt, "yyyy/mm/dd hh:nn:ss")
+    logStream.WriteLine "ブック: " & ThisWorkbook.Name
+    logStream.WriteLine String$(80, "=")
+
+    WriteLogSection logStream, execSheet, EXEC_LOG_SHEET_NAME, UBound(ExecutionLogHeaders()) + 1
+    logStream.WriteLine String$(80, "=")
+    WriteLogSection logStream, detailSheet, DETAIL_LOG_SHEET_NAME, UBound(DetailLogHeaders()) + 1
+    logStream.Close
+End Sub
+
+Private Sub WriteLogSection(ByVal logStream As Object, ByVal targetSheet As Worksheet, ByVal sectionName As String, ByVal columnCount As Long)
+    Dim lastRow As Long
+    Dim rowIndex As Long
+    Dim columnIndex As Long
+    Dim lineText As String
+
+    logStream.WriteLine "[" & sectionName & "]"
+
+    lastRow = LastDataRow(targetSheet, 1)
+    If lastRow < 2 Then
+        logStream.WriteLine "(データなし)"
+        logStream.WriteLine vbNullString
+        Exit Sub
+    End If
+
+    For rowIndex = 1 To lastRow
+        lineText = vbNullString
+        For columnIndex = 1 To columnCount
+            If columnIndex > 1 Then
+                lineText = lineText & vbTab
+            End If
+            lineText = lineText & EscapeLogValue(targetSheet.Cells(rowIndex, columnIndex).Value)
+        Next columnIndex
+        logStream.WriteLine lineText
+    Next rowIndex
+
+    logStream.WriteLine vbNullString
+End Sub
+
+Private Sub ClearSheetDataRows(ByVal targetSheet As Worksheet)
+    Dim lastRow As Long
+
+    lastRow = LastDataRow(targetSheet, 1)
+    If lastRow < 2 Then
+        Exit Sub
+    End If
+
+    targetSheet.Rows("2:" & CStr(lastRow)).ClearContents
+End Sub
+
+Private Function BuildImportLogFilePath(ByVal archivedAt As Date) As String
+    Dim baseFolder As String
+    Dim logFolder As String
+
+    baseFolder = ThisWorkbook.Path
+    If Len(baseFolder) = 0 Then
+        baseFolder = Environ$("TEMP")
+    End If
+
+    logFolder = baseFolder & Application.PathSeparator & "log"
+    EnsureFolderExists logFolder
+    BuildImportLogFilePath = logFolder & Application.PathSeparator & "治療日誌取込ログ_" & Format$(archivedAt, "yyyymmdd_hhnnss") & ".log"
+End Function
+
+Private Sub EnsureFolderExists(ByVal folderPath As String)
+    Dim fso As Object
+
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FolderExists(folderPath) Then
+        fso.CreateFolder folderPath
+    End If
+End Sub
+
+Private Function EscapeLogValue(ByVal value As Variant) As String
+    Dim textValue As String
+
+    If IsError(value) Then
+        EscapeLogValue = "#ERROR"
+        Exit Function
+    End If
+
+    If IsEmpty(value) Or IsNull(value) Then
+        Exit Function
+    End If
+
+    If IsDate(value) Then
+        textValue = Format$(CDate(value), "yyyy/mm/dd hh:nn:ss")
+    Else
+        textValue = CStr(value)
+    End If
+
+    textValue = Replace(textValue, vbCrLf, " ")
+    textValue = Replace(textValue, vbCr, " ")
+    textValue = Replace(textValue, vbLf, " ")
+    textValue = Replace(textValue, vbTab, " ")
+    EscapeLogValue = textValue
+End Function
+
 Private Sub SaveAppState(ByRef state As AppState)
     state.ScreenUpdating = Application.ScreenUpdating
     state.EnableEvents = Application.EnableEvents
@@ -1309,6 +1759,9 @@ End Function
 
 Private Function MasterHeaders() As Variant
     MasterHeaders = Array( _
+        "顧客No", _
+        "顧客No判定状態", _
+        "内部取込ID", _
         "日付", _
         "年月", _
         "施術時間", _
